@@ -2,11 +2,13 @@ package qqwry
 
 import (
 	"encoding/binary"
-
-	"github.com/yinheli/mahonia"
-	// "encoding/hex"
+	"encoding/json"
+	"io/ioutil"
+	"log"
 	"net"
 	"os"
+
+	"github.com/yinheli/mahonia"
 )
 
 const (
@@ -15,83 +17,117 @@ const (
 	REDIRECT_MODE_2 = 0x02
 )
 
-// @author yinheli
 type QQwry struct {
-	Ip       string
-	Country  string
-	City     string
-	filepath string
-	file     *os.File
+	buff  []byte
+	start uint32
+	end   uint32
+}
+type Rq struct {
+	Ip      string `json:"Ip"`
+	Country string `json:"City"`
+	City    string `json:"Detail"`
+	Err     int    `json:"Err"`
+	Msg     string `json:"ErrorMsg"`
 }
 
 func NewQQwry(file string) (qqwry *QQwry) {
-	qqwry = &QQwry{filepath: file}
-	return
+	qqwry = &QQwry{}
+	f, e := os.Open(file)
+	if e != nil {
+		log.Println(e)
+		return nil
+	}
+	defer f.Close()
+	qqwry.buff, e = ioutil.ReadAll(f)
+	if e != nil {
+		log.Println(e)
+		return nil
+	}
+	qqwry.start = binary.LittleEndian.Uint32(qqwry.buff[:4])
+	qqwry.end = binary.LittleEndian.Uint32(qqwry.buff[4:8])
+	return qqwry
 }
+func (this *Rq) String() string {
 
-func (this *QQwry) Find(ip string) {
-	if this.filepath == "" {
-		return
-	}
-
-	file, err := os.OpenFile(this.filepath, os.O_RDONLY, 0400)
-	defer file.Close()
-	if err != nil {
-		return
-	}
-	this.file = file
-
-	this.Ip = ip
-	offset := this.searchIndex(binary.BigEndian.Uint32(net.ParseIP(ip).To4()))
-	// log.Println("loc offset:", offset)
-	if offset <= 0 {
-		return
+	d, _ := json.Marshal(this)
+	return string(d)
+}
+func (this *QQwry) Find(ip string) *Rq {
+	rq := &Rq{Ip: ip}
+	if this.buff == nil {
+		rq.Err = 3
+		rq.Msg = "QQwry没有初始化"
+		return rq
 	}
 
 	var country []byte
 	var area []byte
-
+	ip_1 := net.ParseIP(ip)
+	if ip_1 == nil {
+		rq.Err = 1
+		rq.Msg = "错误的IP格式"
+		return rq
+	}
+	offset := this.searchRecord(binary.BigEndian.Uint32(ip_1.To4()))
+	if offset <= 0 {
+		rq.Err = 2
+		rq.Msg = "IP地址没找到归属地"
+		return rq
+	}
 	mode := this.readMode(offset + 4)
-	// log.Println("mode", mode)
 	if mode == REDIRECT_MODE_1 {
-		countryOffset := this.readUInt24()
+		countryOffset := this.readUint32FromByte3(offset + 5)
+
 		mode = this.readMode(countryOffset)
-		// log.Println("1 - mode", mode)
 		if mode == REDIRECT_MODE_2 {
-			c := this.readUInt24()
+			c := this.readUint32FromByte3(countryOffset + 1)
 			country = this.readString(c)
 			countryOffset += 4
+			area = this.readArea(countryOffset)
+
 		} else {
 			country = this.readString(countryOffset)
 			countryOffset += uint32(len(country) + 1)
+			area = this.readArea(countryOffset)
 		}
-		area = this.readArea(countryOffset)
+
 	} else if mode == REDIRECT_MODE_2 {
-		countryOffset := this.readUInt24()
+		countryOffset := this.readUint32FromByte3(offset + 5)
 		country = this.readString(countryOffset)
 		area = this.readArea(offset + 8)
-	} else {
-		country = this.readString(offset + 4)
-		area = this.readArea(offset + uint32(5+len(country)))
 	}
-
 	enc := mahonia.NewDecoder("gbk")
-	this.Country = enc.ConvertString(string(country))
-	this.City = enc.ConvertString(string(area))
-
+	rq.Country = enc.ConvertString(string(country))
+	rq.City = enc.ConvertString(string(area))
+	return rq
 }
 
+func (this *QQwry) readUint32FromByte3(offset uint32) uint32 {
+	return byte3ToUInt32(this.buff[offset : offset+3])
+}
 func (this *QQwry) readMode(offset uint32) byte {
-	this.file.Seek(int64(offset), 0)
-	mode := make([]byte, 1)
-	this.file.Read(mode)
-	return mode[0]
+	return this.buff[offset : offset+1][0]
+}
+
+func (this *QQwry) readString(offset uint32) []byte {
+
+	i := 0
+	for {
+
+		if this.buff[int(offset)+i] == 0 {
+			break
+		} else {
+			i++
+		}
+
+	}
+	return this.buff[offset : int(offset)+i]
 }
 
 func (this *QQwry) readArea(offset uint32) []byte {
 	mode := this.readMode(offset)
 	if mode == REDIRECT_MODE_1 || mode == REDIRECT_MODE_2 {
-		areaOffset := this.readUInt24()
+		areaOffset := this.readUint32FromByte3(offset + 1)
 		if areaOffset == 0 {
 			return []byte("")
 		} else {
@@ -103,43 +139,36 @@ func (this *QQwry) readArea(offset uint32) []byte {
 	return []byte("")
 }
 
-func (this *QQwry) readString(offset uint32) []byte {
-	this.file.Seek(int64(offset), 0)
-	data := make([]byte, 0, 30)
-	buf := make([]byte, 1)
-	for {
-		this.file.Read(buf)
-		if buf[0] == 0 {
-			break
-		}
-		data = append(data, buf[0])
-	}
-	return data
+func (this *QQwry) getRecord(offset uint32) []byte {
+	return this.buff[offset : offset+INDEX_LEN]
 }
 
-func (this *QQwry) searchIndex(ip uint32) uint32 {
-	header := make([]byte, 8)
-	this.file.Seek(0, 0)
-	this.file.Read(header)
+func (this *QQwry) getIPFromRecord(buf []byte) uint32 {
+	return binary.LittleEndian.Uint32(buf[:4])
+}
 
-	start := binary.LittleEndian.Uint32(header[:4])
-	end := binary.LittleEndian.Uint32(header[4:])
+func (this *QQwry) getAddrFromRecord(buf []byte) uint32 {
+	return byte3ToUInt32(buf[4:7])
+}
+
+func (this *QQwry) searchRecord(ip uint32) uint32 {
+
+	start := this.start
+	end := this.end
 
 	// log.Printf("len info %v, %v ---- %v, %v", start, end, hex.EncodeToString(header[:4]), hex.EncodeToString(header[4:]))
-
 	for {
 		mid := this.getMiddleOffset(start, end)
-		this.file.Seek(int64(mid), 0)
-		buf := make([]byte, INDEX_LEN)
-		this.file.Read(buf)
-		_ip := binary.LittleEndian.Uint32(buf[:4])
+		buf := this.getRecord(mid)
+		_ip := this.getIPFromRecord(buf)
 
 		// log.Printf(">> %v, %v, %v -- %v", start, mid, end, hex.EncodeToString(buf[:4]))
 
 		if end-start == INDEX_LEN {
-			offset := byte3ToUInt32(buf[4:])
-			this.file.Read(buf)
-			if ip < binary.LittleEndian.Uint32(buf[:4]) {
+			//log.Printf(">> %v, %v, %v -- %v", start, mid, end, hex.EncodeToString(buf[:4]))
+			offset := this.getAddrFromRecord(buf)
+			buf = this.getRecord(mid + INDEX_LEN)
+			if ip < this.getIPFromRecord(buf) {
 				return offset
 			} else {
 				return 0
@@ -152,17 +181,11 @@ func (this *QQwry) searchIndex(ip uint32) uint32 {
 		} else if _ip < ip { // 找到的比较小，向后移
 			start = mid
 		} else if _ip == ip {
-			return byte3ToUInt32(buf[4:])
+			return byte3ToUInt32(buf[4:7])
 		}
 
 	}
 	return 0
-}
-
-func (this *QQwry) readUInt24() uint32 {
-	buf := make([]byte, 3)
-	this.file.Read(buf)
-	return byte3ToUInt32(buf)
 }
 
 func (this *QQwry) getMiddleOffset(start uint32, end uint32) uint32 {
